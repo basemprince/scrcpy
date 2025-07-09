@@ -158,6 +158,49 @@ documented in the following pages:
  - [Video4Linux](doc/v4l2.md)
  - [Shortcuts](doc/shortcuts.md)
 
+## Python client example
+
+The file [`examples/python_client.py`](examples/python_client.py) contains a
+minimal implementation of the scrcpy protocol in Python. It exposes a
+`Client` class which pushes the server to the device via `adb`, forwards a TCP
+port, then connects to the server and decodes the H.264/H.265/AV1 stream with
+[PyAV](https://pyav.org/).
+
+Install the `av` package first:
+
+```bash
+pip install av
+```
+
+To display the frames, install one of the optional display backends:
+
+- [`pygame`](https://pypi.org/project/pygame/) (fastest)
+- [`opencv-python`](https://pypi.org/project/opencv-python/)
+
+Run the client like so:
+
+```bash
+python3 examples/python_client.py
+```
+
+If `pygame` is available, it will be used for efficient display; otherwise,
+`opencv-python` is used when installed. Without either library, the client only
+logs frame information to the console.
+
+You may also stream asynchronously:
+
+```python
+from examples.python_client import Client
+client = Client()
+client.start()  # run in background
+client.join()
+```
+
+By default the script looks for `scrcpy-server-v3.3.1` in the current
+directory, but you may pass `--server` to provide another path. The server JAR
+must match the client version (see the
+[releases page](https://github.com/Genymobile/scrcpy/releases) to download it).
+
 
 ## Resources
 
