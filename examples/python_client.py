@@ -265,7 +265,6 @@ class Client:
         if self.config.control:
             print("Connecting to control socket...")
             self.state.control_sock = socket.create_connection((self.config.host, self.config.port))
-            read_exact(self.state.control_sock, 1)
             print("Control socket connected")
             self.state.control_thread = threading.Thread(
                 target=self._control_loop, args=(self.state.control_sock,), daemon=True
