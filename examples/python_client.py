@@ -159,6 +159,7 @@ class ClientState:
     video_sock: Optional[socket.socket] = None
     control_sock: Optional[socket.socket] = None
     mouse_buttons: int = 0
+    log_thread: Optional[threading.Thread] = None
 
 
 class Client:
@@ -174,6 +175,14 @@ class Client:
 
         self.state = ClientState()
         self.run()
+
+    def _log_server_output(self, pipe) -> None:
+        """Continuously print server output lines."""
+        try:
+            for line in iter(pipe.readline, b""):
+                print(line.decode(errors="ignore"), end="")
+        finally:
+            pipe.close()
 
     def _start_server(self) -> None:
         """Start the scrcpy server on the Android device."""
@@ -206,13 +215,28 @@ class Client:
         if self.config.lock_screen_orientation != LOCK_SCREEN_ORIENTATION_UNLOCKED:
             cmd.append(f"lock_screen_orientation={self.config.lock_screen_orientation}")
 
-        self.state.proc = subprocess.Popen(cmd)  # pylint: disable=consider-using-with
+        print("Starting server:", " ".join(cmd))
+        self.state.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )  # pylint: disable=consider-using-with
+        if self.state.proc.stdout:
+            self.state.log_thread = threading.Thread(
+                target=self._log_server_output,
+                args=(self.state.proc.stdout,),
+                daemon=True,
+            )
+            self.state.log_thread.start()
 
     def _stop_server(self) -> None:
         """Stop the scrcpy server."""
         if self.state.proc:
             self.state.proc.terminate()
             self.state.proc.wait()
+        if self.state.log_thread:
+            self.state.log_thread.join(timeout=1)
         subprocess.run(self.adb_cmd + ["forward", "--remove", f"tcp:{self.config.port}"], check=True)
         if self.state.video_sock:
             self.state.video_sock.close()
@@ -228,15 +252,21 @@ class Client:
             self.state.thread.join()
         if self.state.control_thread:
             self.state.control_thread.join()
+        if self.state.log_thread:
+            self.state.log_thread.join(timeout=1)
 
     def run(self) -> None:
         """Start the scrcpy client and video loop."""
         self._start_server()
         time.sleep(1)
+        print("Connecting to video socket...")
         self.state.video_sock = socket.create_connection((self.config.host, self.config.port))
+        print("Video socket connected")
         if self.config.control:
+            print("Connecting to control socket...")
             self.state.control_sock = socket.create_connection((self.config.host, self.config.port))
             read_exact(self.state.control_sock, 1)
+            print("Control socket connected")
             self.state.control_thread = threading.Thread(
                 target=self._control_loop, args=(self.state.control_sock,), daemon=True
             )
@@ -249,6 +279,7 @@ class Client:
 
     def _init_decoder(self, sock: socket.socket) -> Tuple[av.CodecContext, int, int]:
         """Initialize decoder and return decoder, width, and height."""
+        print("Initializing decoder...")
         _ = read_exact(sock, 1)
         self.state.device_name = read_exact(sock, 64).split(b"\0", 1)[0].decode()
         raw_codec = struct.unpack(">I", read_exact(sock, 4))[0]
@@ -291,6 +322,7 @@ class Client:
                 for decoded_frame in decoder.decode(packet):
                     img = decoded_frame.to_ndarray(format="rgb24")
                     self.state.last_frame = img
+                    print("Received frame", decoded_frame.pts)
 
         finally:
             self._stop_server()
@@ -300,6 +332,7 @@ class Client:
         try:
             while True:
                 msg_type = read_exact(sock, 1)[0]
+                print(f"Device message type {msg_type}")
                 if msg_type == 0:  # DEVICE_MSG_TYPE_CLIPBOARD
                     length = struct.unpack(">I", read_exact(sock, 4))[0]
                     text = read_exact(sock, length).decode("utf-8")
@@ -320,6 +353,7 @@ class Client:
         raw = text.encode("utf-8")
         msg = struct.pack(">BI", CONTROL_MSG_TYPE_INJECT_TEXT, len(raw)) + raw
         self.state.control_sock.sendall(msg)
+        print(f"Sent text: {text}")
 
     def inject_keycode(self, keycode: int, action: int, repeat: int = 0, meta: int = 0) -> None:
         """Send a keycode injection message."""
@@ -334,6 +368,7 @@ class Client:
             meta,
         )
         self.state.control_sock.sendall(msg)
+        print(f"Sent keycode {keycode} action {action}")
 
     def inject_touch(
         self,
@@ -365,6 +400,9 @@ class Client:
             buttons,
         )
         self.state.control_sock.sendall(msg)
+        print(
+            f"Touch {action} at ({x},{y}) pressure={pressure:.2f} btn={action_button} buttons={buttons}"
+        )
 
     def back_or_screen_on(self, action: int) -> None:
         """Send BACK_OR_SCREEN_ON control message."""
@@ -372,18 +410,21 @@ class Client:
             return
         msg = struct.pack(">BB", CONTROL_MSG_TYPE_BACK_OR_SCREEN_ON, action)
         self.state.control_sock.sendall(msg)
+        print(f"BACK_OR_SCREEN_ON action {action}")
 
     def expand_notification_panel(self) -> None:
         if self.state.control_sock:
             self.state.control_sock.sendall(
                 struct.pack(">B", CONTROL_MSG_TYPE_EXPAND_NOTIFICATION_PANEL)
             )
+            print("Expand notification panel")
 
     def collapse_panels(self) -> None:
         if self.state.control_sock:
             self.state.control_sock.sendall(
                 struct.pack(">B", CONTROL_MSG_TYPE_COLLAPSE_PANELS)
             )
+            print("Collapse panels")
 
 
 if __name__ == "__main__":
