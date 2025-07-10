@@ -1,4 +1,7 @@
-"""Minimal scrcpy client using ADB and PyAV to stream Android screen."""
+"""Minimal scrcpy client using ADB and PyAV to stream Android screen.
+
+This version also implements basic control to send keyboard and mouse events
+to the Android device, similar to the official C client."""
 
 import argparse
 import os
@@ -28,6 +31,77 @@ PTS_MASK = FLAG_KEY_FRAME - 1
 SERVER_VERSION = "3.3.1"
 DEVICE_SERVER_PATH = "/data/local/tmp/scrcpy-server.jar"
 LOCK_SCREEN_ORIENTATION_UNLOCKED = 0
+
+# Control protocol constants -------------------------------------------------
+CONTROL_MSG_TYPE_INJECT_KEYCODE = 0
+CONTROL_MSG_TYPE_INJECT_TEXT = 1
+CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT = 2
+
+AMOTION_EVENT_ACTION_DOWN = 0
+AMOTION_EVENT_ACTION_UP = 1
+AMOTION_EVENT_ACTION_MOVE = 2
+
+AMOTION_EVENT_BUTTON_PRIMARY = 1 << 0
+AMOTION_EVENT_BUTTON_SECONDARY = 1 << 1
+AMOTION_EVENT_BUTTON_TERTIARY = 1 << 2
+
+SC_POINTER_ID_MOUSE = -1 & 0xFFFFFFFFFFFFFFFF
+
+# Map pygame key constants to Android keycodes (partial)
+KEY_MAP = {
+    pygame.K_a: 29,
+    pygame.K_b: 30,
+    pygame.K_c: 31,
+    pygame.K_d: 32,
+    pygame.K_e: 33,
+    pygame.K_f: 34,
+    pygame.K_g: 35,
+    pygame.K_h: 36,
+    pygame.K_i: 37,
+    pygame.K_j: 38,
+    pygame.K_k: 39,
+    pygame.K_l: 40,
+    pygame.K_m: 41,
+    pygame.K_n: 42,
+    pygame.K_o: 43,
+    pygame.K_p: 44,
+    pygame.K_q: 45,
+    pygame.K_r: 46,
+    pygame.K_s: 47,
+    pygame.K_t: 48,
+    pygame.K_u: 49,
+    pygame.K_v: 50,
+    pygame.K_w: 51,
+    pygame.K_x: 52,
+    pygame.K_y: 53,
+    pygame.K_z: 54,
+    pygame.K_0: 7,
+    pygame.K_1: 8,
+    pygame.K_2: 9,
+    pygame.K_3: 10,
+    pygame.K_4: 11,
+    pygame.K_5: 12,
+    pygame.K_6: 13,
+    pygame.K_7: 14,
+    pygame.K_8: 15,
+    pygame.K_9: 16,
+    pygame.K_SPACE: 62,
+    pygame.K_RETURN: 66,
+    pygame.K_BACKSPACE: 67,
+    pygame.K_TAB: 61,
+    pygame.K_ESCAPE: 111,
+    pygame.K_LEFT: 21,
+    pygame.K_RIGHT: 22,
+    pygame.K_UP: 19,
+    pygame.K_DOWN: 20,
+}
+
+# Map pygame mouse buttons to Android motion event buttons
+BUTTON_MAP = {
+    1: AMOTION_EVENT_BUTTON_PRIMARY,
+    2: AMOTION_EVENT_BUTTON_TERTIARY,
+    3: AMOTION_EVENT_BUTTON_SECONDARY,
+}
 
 
 def read_exact(sock: socket.socket, length: int) -> bytes:
@@ -69,6 +143,9 @@ class ClientState:
     resolution: Optional[Tuple[int, int]] = None
     device_name: Optional[str] = None
     thread: Optional[threading.Thread] = None
+    control_sock: Optional[socket.socket] = None
+    ready: threading.Event = threading.Event()
+    mouse_buttons: int = 0
 
 
 class Client:
@@ -100,7 +177,7 @@ class Client:
             SERVER_VERSION,
             "tunnel_forward=true",
             "audio=false",
-            "control=false",
+            "control=true",
             "cleanup=false",
         ]
         if self.config.max_width:
@@ -123,6 +200,8 @@ class Client:
         if self.state.proc:
             self.state.proc.terminate()
             self.state.proc.wait()
+        if self.state.control_sock:
+            self.state.control_sock.close()
         subprocess.run(self.adb_cmd + ["forward", "--remove", f"tcp:{self.config.port}"], check=True)
 
     def stop(self) -> None:
@@ -135,6 +214,9 @@ class Client:
         time.sleep(1)
         self.state.thread = threading.Thread(target=self._video_loop, daemon=True)
         self.state.thread.start()
+        # Wait until video connection is initialized before opening control
+        self.state.ready.wait()
+        self.state.control_sock = socket.create_connection((self.config.host, self.config.port))
 
     def _init_decoder(self, sock: socket.socket) -> Tuple[av.CodecContext, int, int]:
         """Initialize decoder and return decoder, width, and height."""
@@ -150,39 +232,83 @@ class Client:
         decoder = av.CodecContext.create(codec_name, "r")
         return decoder, width_, height_
 
+    def _send_msg(self, msg: bytes) -> None:
+        if self.state.control_sock:
+            self.state.control_sock.sendall(msg)
+
+    def inject_keycode(self, keycode: int, action: int) -> None:
+        msg = struct.pack(
+            ">BBIII",
+            CONTROL_MSG_TYPE_INJECT_KEYCODE,
+            action,
+            keycode,
+            0,
+            0,
+        )
+        self._send_msg(msg)
+
+    def inject_touch(
+        self,
+        action: int,
+        x: int,
+        y: int,
+        pressure: float,
+        action_button: int,
+        buttons: int,
+    ) -> None:
+        width, height = self.state.resolution or (0, 0)
+        p = int(max(0.0, min(1.0, pressure)) * 0x10000)
+        if p > 0xFFFF:
+            p = 0xFFFF
+        msg = struct.pack(
+            ">BBQiiHHHII",
+            CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT,
+            action,
+            SC_POINTER_ID_MOUSE,
+            x,
+            y,
+            width,
+            height,
+            p,
+            action_button,
+            buttons,
+        )
+        self._send_msg(msg)
+
     def _video_loop(self) -> None:
         """Main loop to receive and decode video packets."""
         try:
-            with socket.create_connection((self.config.host, self.config.port)) as sock:
-                decoder, _, _ = self._init_decoder(sock)
-                config_data = b""
+            sock = socket.create_connection((self.config.host, self.config.port))
+            decoder, _, _ = self._init_decoder(sock)
+            self.state.ready.set()
+            config_data = b""
 
-                while True:
-                    header = read_exact(sock, HEADER_SIZE)
-                    pts_flags, size = struct.unpack(">QI", header)
-                    packet_data = read_exact(sock, size)
+            while True:
+                header = read_exact(sock, HEADER_SIZE)
+                pts_flags, size = struct.unpack(">QI", header)
+                packet_data = read_exact(sock, size)
 
-                    if pts_flags & FLAG_CONFIG:
-                        config_data = packet_data
-                        continue
+                if pts_flags & FLAG_CONFIG:
+                    config_data = packet_data
+                    continue
 
-                    if config_data:
-                        packet_data = config_data + packet_data
-                        config_data = b""
+                if config_data:
+                    packet_data = config_data + packet_data
+                    config_data = b""
 
-                    packet = av.Packet(packet_data)
-                    packet.pts = pts_flags & PTS_MASK
-                    if pts_flags & FLAG_KEY_FRAME:
-                        try:
-                            packet.is_keyframe = True
-                        except AttributeError:
-                            pass
+                packet = av.Packet(packet_data)
+                packet.pts = pts_flags & PTS_MASK
+                if pts_flags & FLAG_KEY_FRAME:
+                    try:
+                        packet.is_keyframe = True
+                    except AttributeError:
+                        pass
 
-                    for decoded_frame in decoder.decode(packet):
-                        img = decoded_frame.to_ndarray(format="rgb24")
-                        self.state.last_frame = img
-
+                for decoded_frame in decoder.decode(packet):
+                    img = decoded_frame.to_ndarray(format="rgb24")
+                    self.state.last_frame = img
         finally:
+            sock.close()
             self._stop_server()
 
 
@@ -215,6 +341,37 @@ if __name__ == "__main__":
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     raise KeyboardInterrupt
+                if event.type in (pygame.KEYDOWN, pygame.KEYUP):
+                    keycode = KEY_MAP.get(event.key)
+                    if keycode is not None:
+                        action = AMOTION_EVENT_ACTION_DOWN if event.type == pygame.KEYDOWN else AMOTION_EVENT_ACTION_UP
+                        client.inject_keycode(keycode, action)
+                if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
+                    btn = BUTTON_MAP.get(event.button)
+                    if btn is not None:
+                        down = event.type == pygame.MOUSEBUTTONDOWN
+                        if down:
+                            client.state.mouse_buttons |= btn
+                        else:
+                            client.state.mouse_buttons &= ~btn
+                        action = AMOTION_EVENT_ACTION_DOWN if down else AMOTION_EVENT_ACTION_UP
+                        client.inject_touch(
+                            action,
+                            event.pos[0],
+                            event.pos[1],
+                            1.0 if down else 0.0,
+                            btn if down else 0,
+                            client.state.mouse_buttons,
+                        )
+                if event.type == pygame.MOUSEMOTION and client.state.mouse_buttons:
+                    client.inject_touch(
+                        AMOTION_EVENT_ACTION_MOVE,
+                        event.pos[0],
+                        event.pos[1],
+                        1.0,
+                        0,
+                        client.state.mouse_buttons,
+                    )
 
             if client.state.last_frame is not None:
                 current_frame = client.state.last_frame
