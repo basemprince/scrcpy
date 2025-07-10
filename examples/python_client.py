@@ -29,10 +29,25 @@ SERVER_VERSION = "3.3.1"
 DEVICE_SERVER_PATH = "/data/local/tmp/scrcpy-server.jar"
 LOCK_SCREEN_ORIENTATION_UNLOCKED = 0
 
-# Key and action constants (partial)
-KEYEVENT_ACTION_DOWN = 0
-KEYEVENT_ACTION_UP = 1
+# Control protocol ------------------------------------------------------------
+# Only the message types and constants we need are defined here.  This mirrors
+# the values used by the C implementation.
 
+CONTROL_MSG_TYPE_INJECT_KEYCODE = 0
+CONTROL_MSG_TYPE_INJECT_TEXT = 1
+CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT = 2
+
+AMOTION_EVENT_ACTION_DOWN = 0
+AMOTION_EVENT_ACTION_UP = 1
+AMOTION_EVENT_ACTION_MOVE = 2
+
+AMOTION_EVENT_BUTTON_PRIMARY = 1 << 0
+AMOTION_EVENT_BUTTON_SECONDARY = 1 << 1
+AMOTION_EVENT_BUTTON_TERTIARY = 1 << 2
+
+SC_POINTER_ID_MOUSE = -1 & 0xFFFFFFFFFFFFFFFF
+
+# Map pygame key constants to Android key codes (partial)
 ANDROID_KEYCODES = {
     pygame.K_a: 29,
     pygame.K_b: 30,
@@ -73,6 +88,19 @@ ANDROID_KEYCODES = {
     pygame.K_SPACE: 62,
     pygame.K_RETURN: 66,
     pygame.K_BACKSPACE: 67,
+    pygame.K_TAB: 61,
+    pygame.K_ESCAPE: 111,
+    pygame.K_LEFT: 21,
+    pygame.K_RIGHT: 22,
+    pygame.K_UP: 19,
+    pygame.K_DOWN: 20,
+}
+
+# Map pygame mouse buttons to Android motion event buttons
+MOUSE_BUTTON_MAP = {
+    1: AMOTION_EVENT_BUTTON_PRIMARY,
+    2: AMOTION_EVENT_BUTTON_TERTIARY,
+    3: AMOTION_EVENT_BUTTON_SECONDARY,
 }
 
 
@@ -119,6 +147,7 @@ class ClientState:
     control_thread: Optional[threading.Thread] = None
     video_sock: Optional[socket.socket] = None
     control_sock: Optional[socket.socket] = None
+    mouse_buttons: int = 0
 
 
 class Client:
@@ -278,20 +307,51 @@ class Client:
         if not self.state.control_sock:
             return
         raw = text.encode("utf-8")
-        msg = struct.pack(">BI", 1, len(raw)) + raw
+        msg = struct.pack(">BI", CONTROL_MSG_TYPE_INJECT_TEXT, len(raw)) + raw
         self.state.control_sock.sendall(msg)
 
-    def send_keycode(self, keycode: int, action: int, repeat: int = 0, meta: int = 0) -> None:
+    def inject_keycode(self, keycode: int, action: int, repeat: int = 0, meta: int = 0) -> None:
         """Send a keycode injection message."""
         if not self.state.control_sock:
             return
         msg = struct.pack(
             ">BBIII",
-            0,  # TYPE_INJECT_KEYCODE
+            CONTROL_MSG_TYPE_INJECT_KEYCODE,
             action,
             keycode,
             repeat,
             meta,
+        )
+        self.state.control_sock.sendall(msg)
+
+    def inject_touch(
+        self,
+        action: int,
+        x: int,
+        y: int,
+        pressure: float,
+        action_button: int,
+        buttons: int,
+    ) -> None:
+        """Send a touch (mouse) event to the device."""
+        if not self.state.control_sock or not self.state.resolution:
+            return
+        width, height = self.state.resolution
+        p = int(max(0.0, min(1.0, pressure)) * 0x10000)
+        if p > 0xFFFF:
+            p = 0xFFFF
+        msg = struct.pack(
+            ">BBQiiHHHII",
+            CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT,
+            action,
+            SC_POINTER_ID_MOUSE,
+            x,
+            y,
+            width,
+            height,
+            p,
+            action_button,
+            buttons,
         )
         self.state.control_sock.sendall(msg)
 
@@ -328,8 +388,34 @@ if __name__ == "__main__":
                 if event.type in (pygame.KEYDOWN, pygame.KEYUP):
                     keycode = ANDROID_KEYCODES.get(event.key)
                     if keycode is not None:
-                        action = KEYEVENT_ACTION_DOWN if event.type == pygame.KEYDOWN else KEYEVENT_ACTION_UP
-                        client.send_keycode(keycode, action)
+                        action = AMOTION_EVENT_ACTION_DOWN if event.type == pygame.KEYDOWN else AMOTION_EVENT_ACTION_UP
+                        client.inject_keycode(keycode, action)
+                if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
+                    button = MOUSE_BUTTON_MAP.get(event.button)
+                    if button is not None:
+                        down = event.type == pygame.MOUSEBUTTONDOWN
+                        if down:
+                            client.state.mouse_buttons |= button
+                        else:
+                            client.state.mouse_buttons &= ~button
+                        action = AMOTION_EVENT_ACTION_DOWN if down else AMOTION_EVENT_ACTION_UP
+                        client.inject_touch(
+                            action,
+                            event.pos[0],
+                            event.pos[1],
+                            1.0 if down else 0.0,
+                            button if down else 0,
+                            client.state.mouse_buttons,
+                        )
+                if event.type == pygame.MOUSEMOTION and client.state.mouse_buttons:
+                    client.inject_touch(
+                        AMOTION_EVENT_ACTION_MOVE,
+                        event.pos[0],
+                        event.pos[1],
+                        1.0,
+                        0,
+                        client.state.mouse_buttons,
+                    )
 
             if client.state.last_frame is not None:
                 current_frame = client.state.last_frame
