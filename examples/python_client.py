@@ -277,9 +277,28 @@ class Client:
 
     def _video_loop(self) -> None:
         """Main loop to receive and decode video packets."""
+        sock: Optional[socket.socket] = None
         try:
-            sock = socket.create_connection((self.config.host, self.config.port))
+            # Retry connection a few times in case the server is not yet ready
+            for _ in range(20):
+                try:
+                    sock = socket.create_connection((self.config.host, self.config.port))
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            if not sock:
+                print("Failed to connect to scrcpy server")
+                return
+
             decoder, _, _ = self._init_decoder(sock)
+
+            # Open the control connection once video is ready
+            try:
+                self.state.control_sock = socket.create_connection((self.config.host, self.config.port))
+            except OSError as exc:
+                print(f"Could not open control connection: {exc}")
+
+
             self.state.ready.set()
             config_data = b""
 
@@ -308,7 +327,8 @@ class Client:
                     img = decoded_frame.to_ndarray(format="rgb24")
                     self.state.last_frame = img
         finally:
-            sock.close()
+            if sock:
+                sock.close()
             self._stop_server()
 
 
