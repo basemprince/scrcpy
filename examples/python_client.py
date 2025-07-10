@@ -36,6 +36,11 @@ LOCK_SCREEN_ORIENTATION_UNLOCKED = 0
 CONTROL_MSG_TYPE_INJECT_KEYCODE = 0
 CONTROL_MSG_TYPE_INJECT_TEXT = 1
 CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT = 2
+CONTROL_MSG_TYPE_INJECT_SCROLL_EVENT = 3
+CONTROL_MSG_TYPE_BACK_OR_SCREEN_ON = 4
+CONTROL_MSG_TYPE_EXPAND_NOTIFICATION_PANEL = 5
+CONTROL_MSG_TYPE_EXPAND_SETTINGS_PANEL = 6
+CONTROL_MSG_TYPE_COLLAPSE_PANELS = 7
 
 AMOTION_EVENT_ACTION_DOWN = 0
 AMOTION_EVENT_ACTION_UP = 1
@@ -94,6 +99,12 @@ ANDROID_KEYCODES = {
     pygame.K_RIGHT: 22,
     pygame.K_UP: 19,
     pygame.K_DOWN: 20,
+    # Additional keycodes
+    pygame.K_F1: 3,   # HOME
+    pygame.K_F2: 4,   # BACK
+    pygame.K_F3: 187, # APP_SWITCH
+    pygame.K_F4: 82,  # MENU
+    pygame.K_F5: 26,  # POWER
 }
 
 # Map pygame mouse buttons to Android motion event buttons
@@ -355,6 +366,25 @@ class Client:
         )
         self.state.control_sock.sendall(msg)
 
+    def back_or_screen_on(self, action: int) -> None:
+        """Send BACK_OR_SCREEN_ON control message."""
+        if not self.state.control_sock:
+            return
+        msg = struct.pack(">BB", CONTROL_MSG_TYPE_BACK_OR_SCREEN_ON, action)
+        self.state.control_sock.sendall(msg)
+
+    def expand_notification_panel(self) -> None:
+        if self.state.control_sock:
+            self.state.control_sock.sendall(
+                struct.pack(">B", CONTROL_MSG_TYPE_EXPAND_NOTIFICATION_PANEL)
+            )
+
+    def collapse_panels(self) -> None:
+        if self.state.control_sock:
+            self.state.control_sock.sendall(
+                struct.pack(">B", CONTROL_MSG_TYPE_COLLAPSE_PANELS)
+            )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="scrcpy minimal client")
@@ -386,9 +416,37 @@ if __name__ == "__main__":
                 if event.type == pygame.QUIT:
                     raise KeyboardInterrupt
                 if event.type in (pygame.KEYDOWN, pygame.KEYUP):
+                    action = (
+                        AMOTION_EVENT_ACTION_DOWN
+                        if event.type == pygame.KEYDOWN
+                        else AMOTION_EVENT_ACTION_UP
+                    )
+                    mods = pygame.key.get_mods()
+                    if mods & (pygame.KMOD_LALT | pygame.KMOD_LMETA) and not (mods & pygame.KMOD_SHIFT) and not event.repeat:
+                        if event.key == pygame.K_h:
+                            client.inject_keycode(3, action)  # HOME
+                            continue
+                        if event.key in (pygame.K_b, pygame.K_BACKSPACE):
+                            client.back_or_screen_on(action)
+                            continue
+                        if event.key == pygame.K_s:
+                            client.inject_keycode(187, action)  # APP_SWITCH
+                            continue
+                        if event.key == pygame.K_m:
+                            client.inject_keycode(82, action)  # MENU
+                            continue
+                        if event.key == pygame.K_p:
+                            client.inject_keycode(26, action)  # POWER
+                            continue
+                        if event.key == pygame.K_n:
+                            if mods & pygame.KMOD_SHIFT:
+                                client.collapse_panels()
+                            elif event.type == pygame.KEYDOWN:
+                                client.expand_notification_panel()
+                            continue
+
                     keycode = ANDROID_KEYCODES.get(event.key)
                     if keycode is not None:
-                        action = AMOTION_EVENT_ACTION_DOWN if event.type == pygame.KEYDOWN else AMOTION_EVENT_ACTION_UP
                         client.inject_keycode(keycode, action)
                 if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
                     button = MOUSE_BUTTON_MAP.get(event.button)
