@@ -7,7 +7,7 @@ import struct
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import av
@@ -82,6 +82,7 @@ class ClientState:
     video_sock: Optional[socket.socket] = None
     control: Optional[Control] = None
     log_thread: Optional[threading.Thread] = None
+    stop_event: threading.Event = field(default_factory=threading.Event)
 
 
 class Client:
@@ -154,13 +155,28 @@ class Client:
 
     def _stop_server(self) -> None:
         """Stop the scrcpy server."""
+        if self.state.stop_event.is_set():
+            return
+        self.state.stop_event.set()
         if self.state.proc:
             self.state.proc.terminate()
             self.state.proc.wait()
+            self.state.proc = None
         if self.state.log_thread:
             self.state.log_thread.join(timeout=1)
-        subprocess.run(self.adb_cmd + ["forward", "--remove", f"tcp:{self.config.port}"], check=True)
+            self.state.log_thread = None
+        try:
+            subprocess.run(
+                self.adb_cmd + ["forward", "--remove", f"tcp:{self.config.port}"],
+                check=False,
+            )
+        except Exception:
+            pass
         if self.state.video_sock:
+            try:
+                self.state.video_sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
             self.state.video_sock.close()
             self.state.video_sock = None
         if self.state.control:
@@ -217,10 +233,16 @@ class Client:
             decoder, _, _ = self._init_decoder(sock)
             config_data = b""
 
-            while True:
-                header = read_exact(sock, HEADER_SIZE)
+            while not self.state.stop_event.is_set():
+                try:
+                    header = read_exact(sock, HEADER_SIZE)
+                except (OSError, EOFError):
+                    break
                 pts_flags, size = struct.unpack(">QI", header)
-                packet_data = read_exact(sock, size)
+                try:
+                    packet_data = read_exact(sock, size)
+                except (OSError, EOFError):
+                    break
 
                 if pts_flags & FLAG_CONFIG:
                     config_data = packet_data
