@@ -214,6 +214,9 @@ class Client:
         time.sleep(1)
         self.state.thread = threading.Thread(target=self._video_loop, daemon=True)
         self.state.thread.start()
+        # Wait until video connection is initialized before opening control
+        self.state.ready.wait()
+        self.state.control_sock = socket.create_connection((self.config.host, self.config.port))
 
     def _init_decoder(self, sock: socket.socket) -> Tuple[av.CodecContext, int, int]:
         """Initialize decoder and return decoder, width, and height."""
@@ -294,6 +297,7 @@ class Client:
                 self.state.control_sock = socket.create_connection((self.config.host, self.config.port))
             except OSError as exc:
                 print(f"Could not open control connection: {exc}")
+
 
             self.state.ready.set()
             config_data = b""
